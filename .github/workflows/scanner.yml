@@ -1,1 +1,67 @@
+name: Binance Early-Pump Scanner V6 Experimental
 
+on:
+  # cron-job.org بيستدعي الـ workflow ده كل 5 دقائق عن طريق GitHub API
+  # (الـ schedule الداخلي اتشال لأنه بيتأخر 15-60+ دقيقة وقت الزحام)
+  workflow_dispatch: {}
+
+# مهم: يمنع تشغيلتين بالتوازي — ده كان بيعمل تعارض git push ويرجّع الـ state لورا
+concurrency:
+  group: scanner-v6
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run one scan cycle
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # فلتر الحلال شغّال افتراضيًا. لإيقافه غيّر القيمة لـ 0
+          SHARIAH_FILTER: "1"
+          # التعلّم الذاتي (قراءة العتبات من state/auto_thresholds.json). لإيقافه: 0
+          AUTO_LEARN: "1"
+          FAKE_BREAKOUT_FILTER_ENABLED: "1"
+        run: python binance_early_pump_v6.py --once
+
+      - name: Self-learning evaluation
+        # بيشتغل بعد المسح عشان يشوف آخر النتايج. مش بيعدّل حاجة إلا كل 10 إشارات جديدة.
+        # فشله ما يوقفش الـ workflow.
+        if: always()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python self_learn_v6.py || true
+
+      - name: Save state and results back to the repo
+        if: always()
+        run: |
+          git config user.name "scanner-bot"
+          git config user.email "scanner-bot@users.noreply.github.com"
+          git add scanner_state_v6.json early_pump_signal_results_v6.csv \
+                  early_watch_log_v6.csv early_scan_diagnostics_v6.csv \
+                  shariah_compliant_bases_v6.json state 2>/dev/null || true
+          # الأول commit وبعدين rebase: (pull --rebase مع تعديلات غير مُحتفَظ بيها كان بيفشل بصمت)
+          git diff --cached --quiet || git commit -m "Update scanner state [skip ci]"
+          git pull --rebase origin ${{ github.ref_name }} || true
+          git push || true
