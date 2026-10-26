@@ -16,6 +16,11 @@ Quick start (put this file next to binance_early_pump_v6.py and entry_quality_v6
     python backtest_v6.py --months 2026-01:2026-09 --max-symbols 60
     python backtest_v6.py --selftest            # machinery test on synthetic data (no network)
 
+On GitHub: Actions tab -> "Backtest V6" -> Run workflow. The report appears in the run's Summary page
+and is saved under reports/ in the repo. Extra report sections: LATENESS buckets, PRECISION vs random,
+EVENT STUDY (how late the signal fires vs real +8% moves, --event-gain) and FILTER STUDY (MACD, Bollinger,
+RSI, StochRSI, 4h gain, acceleration ... tested before/after, split in two halves).
+
 Data: monthly 5m kline zips from https://data.binance.vision (cached in ./bt_data/zips).
 If you cannot download, drop files named  SYMBOL-5m-YYYY-MM.zip  into ./bt_data/zips  and run
 with --no-download.
@@ -250,7 +255,7 @@ def process_symbol(sym):
     SC, cfg = _W["SC"], _W["cfg"]
     A = load_symbol(sym, cfg["months"], cfg["data_dir"], cfg["download"])
     if A is None or len(A) < WINDOW + DAY_BARS + 60:
-        return sym, [], [], 0
+        return sym, [], [], [], 0
     t, o, h, l, c, qv = A[:, 0], A[:, 1], A[:, 2], A[:, 3], A[:, 4], A[:, 5]
     n = len(t)
     max_bars = int(SC["TRADE_TIMEOUT_MIN"] // 5)
@@ -279,6 +284,39 @@ def process_symbol(sym):
     M = np.column_stack([t, o, h, l, c, np.zeros(n), t + BAR_MS - 1, qv, np.zeros(n), np.zeros(n),
                          A[:, 6]]).tolist()
     ol, hl, ll, cl = o.tolist(), h.tolist(), l.tolist(), c.tolist()
+
+    # Indicators on closed bars only (value at index k uses data up to bar k).
+    cser = pd.Series(c)
+    macd_line = cser.ewm(span=12, adjust=False).mean() - cser.ewm(span=26, adjust=False).mean()
+    macd_h = (macd_line - macd_line.ewm(span=9, adjust=False).mean()).to_numpy()
+    dlt = cser.diff()
+    up = dlt.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+    dn = (-dlt.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+    rsi_s = (100 - 100 / (1 + up / dn.replace(0, np.nan))).fillna(100)
+    rmin, rmax = rsi_s.rolling(14).min(), rsi_s.rolling(14).max()
+    stoch = ((rsi_s - rmin) / (rmax - rmin).replace(0, np.nan)).to_numpy()
+    sma20 = cser.rolling(20).mean().to_numpy()
+    sd20 = cser.rolling(20).std(ddof=0).to_numpy()
+
+    def features(i, x):
+        """Lateness / indicator context at the signal (last closed bar k = i-1)."""
+        k = i - 1
+        w = ll[k - 143:k + 1]
+        lowv = min(w)
+        sd = sd20[k]
+        e = i + prim
+        return {
+            "g4h": round(x.get("4h", 0.0), 2),
+            "ext12": round((cl[k] / lowv - 1) * 100, 2) if lowv > 0 else float("nan"),
+            "hrs_since_low12": round((143 - w.index(lowv)) * 5 / 60.0, 2),
+            "ext_ema21": round((cl[k] / x["ema21"] - 1) * 100, 2) if x.get("ema21") else float("nan"),
+            "bb_pos": round((cl[k] - sma20[k]) / (2 * sd), 2) if sd and sd > 0 else float("nan"),
+            "macd_hist": float(macd_h[k]), "macd_prev": float(macd_h[k - 1]),
+            "stochrsi": float(stoch[k]),
+            "accel": round(x["acceleration"], 2), "buy_pressure": round(x["buy_pressure"], 3),
+            "vol1h": round(x["volume_1h"], 2),
+            "fwd2h": round((max(hl[e:e + 24]) / ol[e] - 1) * 100, 2),
+        }
 
     cur = {}
     SC["get_json"] = lambda path, params=None, retries=3: cur["rows"]
@@ -335,6 +373,7 @@ def process_symbol(sym):
             "sl_pct": round(sl_pct, 3), "tp1_pct": round(tp_pct, 3), "tp1_rr": risk["tp1_rr"],
             "g15": round(x["15m"], 2), "vol15": round(x["volume_15m"], 2), "rsi": x.get("rsi14"),
             "liquidity": x["liquidity"], "bars_to_signal": cand["count"],
+            **features(i, x),
         }
         for d in delays:
             e = i + d
@@ -362,8 +401,37 @@ def process_symbol(sym):
             outcome, bars, ex = simulate(ol, hl, ll, cl, e, tr["sl_pct"], tr["tp1_pct"], max_bars)
             gross, net, r = net_return(ol[e], ex, tr["sl_pct"], cost)
             base.append({"symbol": sym, "month": tr["month"], "signal_ts": int(t[int(bi)]),
-                         "outcome": outcome, "net": net, "r": r})
-    return sym, trades, base, int(len(scan_idx))
+                         "outcome": outcome, "net": net, "r": r,
+                         "fwd2h": (max(hl[e:e + 24]) / ol[e] - 1) * 100})
+
+    # Event study: every real +X% move within 2h, and where our signal fell relative to it.
+    events = []
+    H = 24
+    fm = pd.Series(h)[::-1].rolling(H, min_periods=H).max()[::-1].shift(-1).to_numpy()
+    with np.errstate(invalid="ignore", divide="ignore"):
+        ev_mask = base_ok & (fm / c - 1.0 >= cfg["event_gain"] / 100.0)
+    sig_ts = np.array([tr["signal_ts"] for tr in trades], dtype="int64")
+    nxt = -1
+    for s0 in np.where(ev_mask)[0]:
+        s0 = int(s0)
+        if s0 < nxt:
+            continue
+        pk = s0 + 1 + int(np.argmax(h[s0 + 1:s0 + H + 1]))
+        nxt = pk + 1
+        move = (h[pk] / c[s0] - 1) * 100
+        ev = {"symbol": sym, "start_ts": int(t[s0]), "peak_ts": int(t[pk]),
+              "move_pct": round(move, 2), "caught": 0}
+        hit = np.where((sig_ts >= t[s0]) & (sig_ts <= t[pk]))[0] if len(sig_ts) else []
+        if len(hit):
+            tr = trades[int(hit[0])]
+            i = int(np.searchsorted(t, tr["signal_ts"]))
+            e = i + prim
+            done = (cl[i - 1] / cl[s0] - 1) * 100
+            ev.update(caught=1, lateness_min=round((tr["signal_ts"] - t[s0]) / 60000.0, 1),
+                      done_pct=round(done, 2), share_done=round(min(max(done / move, 0.0), 1.0), 3),
+                      left_pct=round((h[pk] / ol[e] - 1) * 100, 2))
+        events.append(ev)
+    return sym, trades, base, events, int(len(scan_idx))
 
 
 # ----------------------------------------------------------------------------------------
@@ -400,7 +468,101 @@ def summarize(df, d):
     })
 
 
-def report(trades, base, cfg, out_dir, months, n_symbols):
+FILTERS = [
+    ("4h gain <= 6%", lambda t: t["g4h"] <= 6),
+    ("extension from 12h low <= 12%", lambda t: t["ext12"] <= 12),
+    ("acceleration <= 4.5 (all lanes)", lambda t: t["accel"] <= 4.5),
+    ("not LOW liquidity", lambda t: t["liquidity"] != "LOW"),
+    ("RSI <= 70", lambda t: t["rsi"] <= 70),
+    ("below upper Bollinger band", lambda t: t["bb_pos"] < 1.0),
+    ("MACD histogram rising", lambda t: t["macd_hist"] > t["macd_prev"]),
+    ("StochRSI <= 0.8", lambda t: t["stochrsi"] <= 0.8),
+    ("COMBO: 4h<=6 & accel<=4.5 & not LOW",
+     lambda t: (t["g4h"] <= 6) & (t["accel"] <= 4.5) & (t["liquidity"] != "LOW")),
+]
+
+
+def _bucket(series, edges, labels):
+    return pd.cut(series, bins=edges, labels=labels, right=False).astype(str)
+
+
+def lateness_sections(trades, base, events, d, P):
+    if "g4h" not in trades.columns:
+        return
+    r = trades[f"r_d{d}"]
+    tr = trades.assign(
+        ext_from_12h_low=_bucket(trades["ext12"], [-1e9, 3, 6, 10, 1e9],
+                                 ["a) <3%", "b) 3-6%", "c) 6-10%", "d) >=10%"]),
+        hours_since_12h_low=_bucket(trades["hrs_since_low12"], [-1, 1, 3, 6, 1e9],
+                                    ["a) <1h", "b) 1-3h", "c) 3-6h", "d) >=6h"]),
+        gain_last_4h=_bucket(trades["g4h"], [-1e9, 2, 4, 8, 1e9],
+                             ["a) <2%", "b) 2-4%", "c) 4-8%", "d) >=8%"]),
+        acceleration=_bucket(trades["accel"], [0, 2, 3.5, 4.5, 1e9],
+                             ["a) <2x", "b) 2-3.5x", "c) 3.5-4.5x", "d) >=4.5x"]))
+    P()
+    P("--- LATENESS: does a more extended signal lose more? ---------------------")
+    for col, title in (("ext_from_12h_low", "price vs lowest low of last 12h"),
+                       ("hours_since_12h_low", "hours since that low"),
+                       ("gain_last_4h", "gain over last 4h"),
+                       ("acceleration", "volume acceleration at signal")):
+        P(f"[{title}]")
+        P(group_summary(tr, col, d)[["n", "win_TP1_%", "SL_%", "avg_net_%", "exp_R_net"]].to_string())
+        P()
+    P("--- PRECISION: how often did a real move follow? (max high in next 2h vs entry) ---")
+    for thr in (3, 5, 8):
+        line = f"followed by >= +{thr}% within 2h: signals {(trades['fwd2h'] >= thr).mean() * 100:5.1f}%"
+        if base is not None and len(base) and "fwd2h" in base.columns:
+            line += f" | random entries {(base['fwd2h'] >= thr).mean() * 100:5.1f}%"
+        P(line)
+    if events is not None and len(events):
+        ev = events
+        caught = ev[ev["caught"] == 1]
+        P()
+        P(f"--- EVENT STUDY: {len(ev)} real moves of >= +{int(round(ev['move_pct'].min()))}% within 2h "
+          "(coins passing the liquidity floor) ---")
+        P(f"signal fired during the move: {len(caught)} ({len(caught) / len(ev) * 100:.1f}% of events)")
+        if len(caught):
+            early = (caught["share_done"] <= 0.33).mean() * 100
+            late = (caught["share_done"] >= 0.66).mean() * 100
+            P(f"when it fired: median {caught['lateness_min'].median():.0f} min after the move began, "
+              f"{caught['share_done'].median() * 100:.0f}% of the move already done")
+            P(f"  caught in the first third of the move: {early:.1f}% | already >=2/3 done: {late:.1f}%")
+            P(f"  upside still available from entry (median): {caught['left_pct'].median():+.2f}%")
+        n_sig = len(trades)
+        P(f"signals that were NOT inside any such move: {n_sig - len(caught)} of {n_sig} "
+          "(some are smaller moves; see PRECISION above)")
+    P()
+    P("--- FILTER STUDY: would removing late/extended signals have helped? --------")
+    cut = trades["signal_ts"].median()
+    h1 = trades["signal_ts"] <= cut
+    all_r, all_1, all_2 = r.mean(), r[h1].mean(), r[~h1].mean()
+    rows, skipped = [], []
+    for name, fn in FILTERS:
+        keep = fn(trades).fillna(True).astype(bool)
+        nk, nr = int(keep.sum()), int((~keep).sum())
+        if nk < 10 or nr < 5:
+            skipped.append(f"{name} (kept {nk} / rejected {nr})")
+            continue
+        k1, k2 = r[keep & h1].mean(), r[keep & ~h1].mean()
+        ok = bool(k1 > all_1 and k2 > all_2 and r[keep].mean() > r[~keep].mean() and nr >= 20)
+        rows.append({"filter": name, "kept": nk, "rejected": nr,
+                     "exp_kept": round(r[keep].mean(), 3), "exp_rejected": round(r[~keep].mean(), 3),
+                     "d_vs_all": round(r[keep].mean() - all_r, 3),
+                     "d_1st_half": round(k1 - all_1, 3), "d_2nd_half": round(k2 - all_2, 3),
+                     "PASS": "YES" if ok else "no"})
+    if rows:
+        P(f"baseline (no filter): n={len(trades)}  exp {all_r:+.3f}R  "
+          f"(1st half {all_1:+.3f}R, 2nd half {all_2:+.3f}R)")
+        P(pd.DataFrame(rows).set_index("filter").to_string())
+        if skipped:
+            P("not evaluated (almost no signal on one side of the filter): " + "; ".join(skipped))
+        P("PASS = improves BOTH halves, rejected group is worse, >=20 rejected. Filters are applied after the")
+        P("fact on the same signals (a rejected signal would really free that coin for a later one), and")
+        P(f"{len(FILTERS)} filters are tried, so one lucky PASS is plausible: confirm on a different period.")
+    P()
+
+
+def report(trades, base, cfg, out_dir, months, n_symbols, events=None):
     d = cfg["delay"]
     lines = []
 
@@ -456,6 +618,7 @@ def report(trades, base, cfg, out_dir, months, n_symbols):
             P(f"{name:11}: n={len(part):4}  win={(part[f'outcome_d{d}'] == 'TP1').mean() * 100:5.1f}%  "
               f"exp={part[f'r_d{d}'].mean():+.3f}R")
     P()
+    lateness_sections(trades, base, events, d, P)
     P("--- Verdict (mechanical, not advice) ------------------------------------")
     mean_r = trades[f"r_d{d}"].mean()
     if n < 100:
@@ -477,6 +640,8 @@ def report(trades, base, cfg, out_dir, months, n_symbols):
     trades.to_csv(os.path.join(out_dir, "trades.csv"), index=False)
     if base is not None:
         base.to_csv(os.path.join(out_dir, "baseline.csv"), index=False)
+    if events is not None and len(events):
+        events.to_csv(os.path.join(out_dir, "events.csv"), index=False)
     return text
 
 
@@ -539,6 +704,8 @@ def main(argv=None):
     ap.add_argument("--delay-candles", type=int, default=1,
                     help="entry at open of signal bar + N bars (5 min each); default 1 = realistic latency")
     ap.add_argument("--baseline-k", type=int, default=5)
+    ap.add_argument("--event-gain", type=float, default=8.0,
+                    help="a 'real move' = +X%% high within 2h (event study), default 8")
     ap.add_argument("--no-btc-guard", action="store_true")
     ap.add_argument("--no-download", action="store_true")
     ap.add_argument("--workers", type=int, default=max(1, min(8, (os.cpu_count() or 2))))
@@ -565,7 +732,12 @@ def main(argv=None):
                 syms = sorted({f.split("-5m-")[0] for f in os.listdir(zdir) if f.endswith(".zip")})
             else:
                 print("Discovering symbols ...")
-                syms = discover_symbols(a.symbols_source, a.data_dir)
+                try:
+                    syms = discover_symbols(a.symbols_source, a.data_dir)
+                except Exception as e:
+                    print(f"  symbol listing from '{a.symbols_source}' failed ({type(e).__name__}: {e}); "
+                          "falling back to exchangeInfo (misses delisted coins)")
+                    syms = discover_symbols("exchange", a.data_dir)
         if a.halal:
             sc_dir = os.path.dirname(os.path.abspath(a.scanner))
             with open(os.path.join(sc_dir, "shariah_compliant_bases_v6.json"), encoding="utf-8") as f:
@@ -580,16 +752,16 @@ def main(argv=None):
     delays = sorted({0, 1, 2, a.delay_candles})
     cfg = {"months": months, "data_dir": a.data_dir, "download": not a.no_download, "fee": a.fee,
            "slip": a.slip, "delay": a.delay_candles, "delays": delays, "baseline_k": a.baseline_k,
-           "btc_guard": not a.no_btc_guard}
+           "btc_guard": not a.no_btc_guard, "event_gain": a.event_gain}
 
-    all_tr, all_base, done, with_data = [], [], 0, 0
+    all_tr, all_base, all_ev, done, with_data = [], [], [], 0, 0
     t0 = time.time()
     with ProcessPoolExecutor(max_workers=a.workers, initializer=_init_worker,
                              initargs=(a.scanner, cfg)) as ex:
         futs = {ex.submit(process_symbol, s): s for s in syms}
         for f in as_completed(futs):
             try:
-                sym, tr, ba, nscan = f.result()
+                sym, tr, ba, ev, nscan = f.result()
             except Exception as e:                       # one bad symbol must not kill the run
                 print(f"  ! {futs[f]}: {type(e).__name__}: {e}")
                 continue
@@ -597,6 +769,7 @@ def main(argv=None):
             with_data += 1 if nscan or tr else 0
             all_tr += tr
             all_base += ba
+            all_ev += ev
             if done % 25 == 0 or done == len(syms):
                 print(f"  {done}/{len(syms)} symbols | signals so far: {len(all_tr)} | "
                       f"{time.time() - t0:.0f}s")
@@ -605,8 +778,9 @@ def main(argv=None):
     if not trades.empty:
         trades = trades.sort_values("signal_ts").reset_index(drop=True)
         trades.insert(1, "signal_time", pd.to_datetime(trades["signal_ts"], unit="ms").dt.strftime("%Y-%m-%d %H:%M"))
-    text = report(trades, base, cfg, a.out, months, with_data)
-    print(f"\nFiles written to: {os.path.abspath(a.out)}  (summary.txt, trades.csv, baseline.csv)")
+    events = pd.DataFrame(all_ev)
+    text = report(trades, base, cfg, a.out, months, with_data, events)
+    print(f"\nFiles written to: {os.path.abspath(a.out)}  (summary.txt, trades.csv, baseline.csv, events.csv)")
     return trades, base, text
 
 
