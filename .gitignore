@@ -1,0 +1,7 @@
+# backtest working data (downloaded candles, results) - never commit
+bt_data/
+backtest_out/
+backtest_out_log.txt
+__pycache__/
+*.pyc
+scanner_v6.log
