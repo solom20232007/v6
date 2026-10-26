@@ -1,0 +1,128 @@
+name: Backtest V6
+
+# يشغَّل يدويًا: Actions -> Backtest V6 -> Run workflow
+# التقرير بيظهر في صفحة الـ run (Summary) وبيتحفظ كمان في مجلد reports/ في الريبو.
+on:
+  workflow_dispatch:
+    inputs:
+      months:
+        description: "الفترة YYYY-MM:YYYY-MM (سيبها فاضية = آخر 12 شهر كاملين)"
+        required: false
+        default: ""
+      universe:
+        description: "العملات"
+        type: choice
+        options: [all, halal]
+        default: all
+      max_symbols:
+        description: "حد أقصى لعدد العملات (0 = الكل، 30 = تجربة سريعة)"
+        required: false
+        default: "0"
+      delay_candles:
+        description: "تأخير الدخول بعد الإشارة بالشموع (كل شمعة 5 دقايق)"
+        required: false
+        default: "1"
+
+# لا تشغيلتين بالتوازي (كلاهما بيكتب في reports/)
+concurrency:
+  group: backtest-v6
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt numpy
+
+      - name: Month key for the data cache
+        id: key
+        run: echo "month=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+
+      # بيانات الشموع المحمّلة بتتخزن مرة في الشهر، فالتشغيلات التالية أسرع بكتير
+      - name: Cache downloaded candles
+        uses: actions/cache@v4
+        with:
+          path: bt_data
+          key: bt-zips-v1-${{ steps.key.outputs.month }}
+          restore-keys: |
+            bt-zips-v1-
+
+      - name: Run backtest
+        shell: bash
+        env:
+          IN_MONTHS: ${{ inputs.months }}
+          IN_UNIVERSE: ${{ inputs.universe }}
+          IN_MAX: ${{ inputs.max_symbols }}
+          IN_DELAY: ${{ inputs.delay_candles }}
+        run: |
+          ARGS=(--scanner binance_early_pump_v6.py --out backtest_out \
+                --max-symbols "${IN_MAX:-0}" --delay-candles "${IN_DELAY:-1}" --workers 4)
+          if [ -n "$IN_MONTHS" ]; then ARGS+=(--months "$IN_MONTHS"); fi
+          if [ "$IN_UNIVERSE" = "halal" ]; then ARGS+=(--halal); fi
+          python -u backtest_v6.py "${ARGS[@]}" 2>&1 | tee backtest_out_log.txt
+
+      - name: Show report on the run page
+        if: always()
+        shell: bash
+        run: |
+          {
+            if [ -f backtest_out/summary.txt ]; then
+              echo '## Backtest V6'
+              echo '```'
+              cat backtest_out/summary.txt
+              echo '```'
+            else
+              echo '## Backtest did not produce a report'
+              echo '```'
+              tail -80 backtest_out_log.txt || true
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload full results (trades, events, baseline)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-results
+          path: |
+            backtest_out/
+            backtest_out_log.txt
+          retention-days: 90
+          if-no-files-found: ignore
+
+      - name: Save report into the repo (reports/)
+        if: success()
+        shell: bash
+        run: |
+          STAMP=$(date -u +%Y-%m-%d_%H%M)
+          DIR="reports/backtest_${STAMP}"
+          mkdir -p "$DIR"
+          cp backtest_out/summary.txt "$DIR/summary.txt"
+          gzip -c backtest_out/trades.csv > "$DIR/trades.csv.gz" || true
+          cp backtest_out/summary.txt reports/LATEST_summary.txt
+          git config user.name "backtest-bot"
+          git config user.email "backtest-bot@users.noreply.github.com"
+          git add reports
+          git commit -m "Backtest report ${STAMP} [skip ci]"
+          for i in 1 2 3; do
+            git pull --rebase origin "${{ github.ref_name }}" && git push && exit 0
+            sleep 5
+          done
+          echo "push failed after 3 attempts" >&2
+          exit 1
