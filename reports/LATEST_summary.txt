@@ -1,0 +1,87 @@
+==============================================================================
+BACKTEST  months=2026-08..2026-09  symbols_with_data=20  fee=0.1%/side slip=0.05%/side  entry_delay=1 bar(s)
+==============================================================================
+Signals: 9  (~4.5 per month, 4 distinct coins)
+
+--- Overall -------------------------------------------------------------
+n                   9.000
+win_TP1_%          33.300
+SL_%               33.300
+timeout_%          33.300
+avg_gross_%        -0.575
+avg_net_%          -0.875
+exp_R_net          -0.237
+breakeven_win_%    46.200
+expectancy 95% CI (day-clustered bootstrap): [-0.702R , +0.267R]
+RANDOM-ENTRY baseline (same coin+month+SL/TP): exp +0.093R  CI [-0.115, +0.307]  win 22.2%  n=45
+EDGE vs random = -0.329R per trade
+
+--- Sensitivity to entry delay (latency between signal and your fill) -----
+delay 0 bar(s) (0 min): exp -0.257R | avg net -0.945% | win 33.3%
+delay 1 bar(s) (5 min): exp -0.237R | avg net -0.875% | win 33.3%
+delay 2 bar(s) (10 min): exp -0.508R | avg net -1.824% | win 22.2%
+
+--- By month (NOT a way to pick months: that would be cherry-picking) -----
+         n  win_TP1_%  SL_%  timeout_%  avg_gross_%  avg_net_%  exp_R_net  breakeven_win_%  random_R
+2026-08  4       25.0  50.0       25.0       -1.065     -1.365     -0.360             44.4     0.318
+2026-09  5       40.0  20.0       40.0       -0.183     -0.483     -0.138             47.6    -0.088
+
+--- By lane -------------------------------------------------------------
+              n  win_TP1_%  SL_%  timeout_%  avg_gross_%  avg_net_%  exp_R_net  breakeven_win_%
+PERSISTENT  6.0       16.7  33.3       50.0       -1.446     -1.746     -0.479             46.2
+STRICT      3.0       66.7  33.3        0.0        1.167      0.867      0.248             46.2
+
+--- By setup ------------------------------------------------------------
+                        n  win_TP1_%  SL_%  timeout_%  avg_gross_%  avg_net_%  exp_R_net  breakeven_win_%
+PERSISTENT EXPLOSION  7.0       14.3  42.9       42.9       -1.739     -2.039     -0.566             45.2
+SMART EARLY PUMP      1.0      100.0   0.0        0.0        3.500      3.200      0.914             50.0
+VOLUME EXPANSION      1.0      100.0   0.0        0.0        3.500      3.200      0.914             50.0
+
+--- Out-of-sample check: first half vs second half of the period ---------
+first half : n=   5  win= 40.0%  exp=-0.106R
+second half: n=   4  win= 25.0%  exp=-0.401R
+
+
+--- LATENESS: does a more extended signal lose more? ---------------------
+[price vs lowest low of last 12h]
+            n  win_TP1_%  SL_%  avg_net_%  exp_R_net
+b) 3-6%   1.0        0.0   0.0     -3.220     -0.920
+c) 6-10%  1.0      100.0   0.0      3.200      0.914
+d) >=10%  7.0       28.6  42.9     -1.122     -0.304
+
+[hours since that low]
+           n  win_TP1_%  SL_%  avg_net_%  exp_R_net
+b) 1-3h  1.0        0.0   0.0     -3.220     -0.920
+d) >=6h  8.0       37.5  37.5     -0.582     -0.151
+
+[gain over last 4h]
+           n  win_TP1_%  SL_%  avg_net_%  exp_R_net
+c) 4-8%  4.0       25.0  25.0     -1.403     -0.401
+d) >=8%  5.0       40.0  40.0     -0.452     -0.106
+
+[volume acceleration at signal]
+               n  win_TP1_%   SL_%  avg_net_%  exp_R_net
+a) <2x       7.0       42.9   28.6     -0.122     -0.018
+c) 3.5-4.5x  1.0        0.0  100.0     -3.800     -1.086
+d) >=4.5x    1.0        0.0    0.0     -3.220     -0.920
+
+--- PRECISION: how often did a real move follow? (max high in next 2h vs entry) ---
+followed by >= +3% within 2h: signals  44.4% | random entries  20.0%
+followed by >= +5% within 2h: signals  33.3% | random entries  13.3%
+followed by >= +8% within 2h: signals  11.1% | random entries   0.0%
+
+--- EVENT STUDY: 160 real moves of >= +8% within 2h (coins passing the liquidity floor) ---
+signal fired during the move: 6 (3.8% of events)
+when it fired: median 82 min after the move began, 70% of the move already done
+  caught in the first third of the move: 0.0% | already >=2/3 done: 50.0%
+  upside still available from entry (median): +2.20%
+signals that were NOT inside any such move: 3 of 9 (some are smaller moves; see PRECISION above)
+
+--- FILTER STUDY: would removing late/extended signals have helped? --------
+
+--- Verdict (mechanical, not advice) ------------------------------------
+* Only 9 signals: too few to conclude anything (aim for 100+).
+* Expectancy -0.237R but the CI includes zero: no proof of an edge.
+* It does not beat random entries on the same coins: the filters add nothing here.
+* Survivorship / data limits: see header of this file. Treat any positive result as a hypothesis
+  to confirm with forward paper trading, never as proof.
