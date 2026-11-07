@@ -53,6 +53,15 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python self_learn_v6.py || true
 
+      - name: Engine digest (optional, fail-open)
+        if: always()
+        continue-on-error: true
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          OUR_RECS_URL: https://raw.githubusercontent.com/solom20232007/Crypto-Explosion-Research-Engine/data/recommendations/latest_recommendations.json
+        run: python engine_digest_v6.py || true
+
       - name: Save state and results back to the repo
         if: always()
         run: |
