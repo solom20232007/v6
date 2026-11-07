@@ -26,3 +26,8 @@ V6 is a separate experimental copy based on the supplied V5 archive. It does not
 - No profitability is claimed. Validate with historical data and paper trading before relying on signals.
 - This archive was syntax-checked and unit-tested for the V6 fake-breakout/track-protection logic. No live Binance run or profitability backtest was performed here.
 - GitHub Actions secrets `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` must be configured in the V6 repository. Review the workflow and cron trigger before enabling it.
+
+## Link with Crypto-Explosion-Research-Engine
+- `our_context_v6.py`: optional, fail-open annotation of alerts with the engine's daily rank (env `OUR_RECS_URL`). Not wired into scanning logic yet; no thresholds were changed.
+- The engine imports this repo's CSVs and `shariah_compliant_bases_v6.json` (third-party list, not religiously verified) and compares outcomes in `api.experimental_unified_evaluation` (meaningful after ~a month).
+- Engine findings so far: no validated threshold changes; signal there is mostly volatility/volume/momentum and modest.
