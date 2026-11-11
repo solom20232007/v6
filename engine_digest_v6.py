@@ -33,9 +33,6 @@ def main():
         sg = r.get("recent_surge")
         if sg:
             lines.append(f"   ⚠️ قفزة حجم قبل {sg['hours_ago']} س (ساعة {sg['hour_ret']*100:+.0f}% بحجم {sg['vol_ratio']:.0f}×): لا تلاحقها — تاريخيًا وسيط -8% بعد 24س")
-        if r.get("eth_contract") and r.get("onchain_ratio_6h") is not None:
-            w = f"، تحويلات حيتان ${r['whale_usd_6h']:,}" if r.get("whale_usd_6h") else ""
-            lines.append(f"   🔗 إيثيريوم: نشاط التحويلات 6س = {r['onchain_ratio_6h']}× المعتاد{w} (معلومة غير مختبرة كمؤشر)")
     if not pick:
         lines.append("لا توجد عملات من قائمة الحلال ضمن أعلى 30 اليوم.")
     lines.append("قائمة الحلال من طرف ثالث وغير مراجعة شرعيًا. تأكد بنفسك.")
